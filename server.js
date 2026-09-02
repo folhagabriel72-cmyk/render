@@ -6,64 +6,63 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-// DISCORD WEBHOOK - TROCA PELO SEU
-const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || 'https://discord.com/api/webhooks/1405566772842967142/02S2Gq7T5T5nJLEkqXq9dO3Pq-0X8Z5x9Y0a1B2c3D4e5F6g7H8i9J0k1L2M3N4O5';
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || '';
+const CLIENT_ID = process.env.CLIENT_ID;
+const CLIENT_SECRET = process.env.CLIENT_SECRET;
+const PIX_KEY = process.env.PIX_KEY;
+
+app.get('/', (req,res)=> res.send('Webhook EFI mTLS online'));
+
+// ROTA QUE REGISTRA O WEBHOOK SOZINHA - É SÓ ACESSAR NO NAVEGADOR
+app.get('/setup', async (req, res) => {
+  try {
+    // Pega token
+    const cred = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
+    const token = await new Promise((resolve, reject) => {
+      const body = JSON.stringify({grant_type:'client_credentials'});
+      const r = https.request({
+        hostname:'pix.api.efipay.com.br', path:'/oauth/token', method:'POST',
+        headers:{'Authorization':`Basic ${cred}`, 'Content-Type':'application/json', 'Content-Length':Buffer.byteLength(body)}
+      }, resp=>{let d=''; resp.on('data',c=>d+=c); resp.on('end',()=>{ try{resolve(JSON.parse(d).access_token)}catch(e){reject(d)}})});
+      r.on('error', reject); r.write(body); r.end();
+    });
+
+    const pfx = fs.readFileSync('./certificado.p12');
+    const webhookUrl = `https://${req.get('host')}/webhook-pix`;
+    const body = JSON.stringify({webhookUrl});
+
+    const result = await new Promise((resolve, reject)=>{
+      const req2 = https.request({
+        hostname:'pix.api.efipay.com.br', path:`/v2/webhook/${PIX_KEY}`, method:'PUT', pfx, passphrase:'',
+        headers:{'Authorization':`Bearer ${token}`, 'Content-Type':'application/json', 'Content-Length':Buffer.byteLength(body)}
+      }, resp=>{let d=''; resp.on('data',c=>d+=c); resp.on('end',()=>resolve({status:resp.statusCode, body:d}))});
+      req2.on('error', reject); req2.write(body); req2.end();
+    });
+
+    res.send(`<h1>Resultado: ${result.status}</h1><pre>${result.body}</pre><br>Webhook URL: ${webhookUrl}<br><br>Se deu 200 ou 201, deu certo! Faz um PIX teste agora.`);
+  } catch(e){ res.status(500).send('Erro: '+e); }
+});
 
 app.post('/webhook-pix', async (req, res) => {
-  console.log('PIX recebido:', JSON.stringify(req.body).substring(0,500));
+  console.log('PIX:', JSON.stringify(req.body));
   try {
-    const pix = req.body.pix && req.body.pix[0];
-    const valor = pix ? pix.valor : '??';
-    const txid = pix ? pix.txid : '';
-    const pagador = pix && pix.pagador ? pix.pagador.nome : 'Cliente';
-
-    await axios.post(DISCORD_WEBHOOK, {
-      embeds: [{
-        title: '💰 PIX RECEBIDO - Nova Paulista RP',
-        color: 3066993,
-        fields: [
-          { name: 'Valor', value: `R$ ${valor}`, inline: true },
-          { name: 'Pagador', value: pagador, inline: true },
-          { name: 'TxID', value: txid || 'N/A', inline: false }
-        ],
-        timestamp: new Date().toISOString()
-      }]
-    });
-  } catch(e){
-    console.error('Erro Discord:', e.message);
-  }
+    const pix = req.body.pix?.[0];
+    if(pix && DISCORD_WEBHOOK){
+      await axios.post(DISCORD_WEBHOOK, {
+        embeds:[{title:'💰 PIX RECEBIDO', color:3066993, fields:[{name:'Valor', value:`R$ ${pix.valor}`},{name:'Pagador', value:pix.pagador?.nome||'Cliente'}]}]
+      });
+    }
+  } catch(e){}
   res.status(200).send('200');
 });
 
-app.get('/', (req,res)=> res.send('Webhook EFI mTLS online - use /webhook-pix'));
-
-// Carrega chain da EFI
 let efiChain;
-try {
-  efiChain = fs.readFileSync('./efi-chain.crt');
-} catch(e){
-  console.log('efi-chain.crt nao encontrado, baixando instrucao no README');
-  efiChain = '';
-}
+try{efiChain=fs.readFileSync('./efi-chain.crt')}catch(e){efiChain=''}
 
-const options = {
-  // Render precisa de cert do servidor - usamos o p12 da EFI como server cert temporario
-  // OU gere um self-signed. Para mTLS funcionar, o mais simples é usar pfx da EFI mesmo
-  pfx: fs.readFileSync('./certificado.p12'),
-  passphrase: process.env.CERT_PASSPHRASE || '',
-  ca: efiChain,
-  requestCert: true,
-  rejectUnauthorized: false
-};
+const options = {pfx:fs.readFileSync('./certificado.p12'), passphrase:'', ca:efiChain, requestCert:true, rejectUnauthorized:false};
+const PORT = process.env.PORT || 10000;
 
-const PORT = process.env.PORT || 3000;
-
-https.createServer(options, (req, res) => {
-  if (!req.client.authorized) {
-    console.log('>> EFI teste 1 - sem certificado - RECUSANDO (correto)');
-    res.writeHead(401);
-    return res.end('mTLS required');
-  }
-  console.log('>> EFI teste 2 - com certificado - ACEITANDO');
-  return app(req, res);
-}).listen(PORT, () => console.log('Servidor mTLS rodando na porta ' + PORT));
+https.createServer(options, (req,res)=>{
+  if(!req.client.authorized){res.writeHead(401); return res.end('mTLS required');}
+  return app(req,res);
+}).listen(PORT, ()=>console.log('mTLS na porta '+PORT));
